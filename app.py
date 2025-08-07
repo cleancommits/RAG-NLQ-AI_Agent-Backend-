@@ -3,8 +3,7 @@ import os
 import pandas as pd
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from langchain_huggingface import HuggingFaceEndpoint
-from langchain_huggingface.embeddings import HuggingFaceEmbeddings
+from langchain_openai import OpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain.chains import RetrievalQA
 from sqlalchemy import create_engine, text
@@ -34,13 +33,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize components (CPU-compatible)
+# Initialize components
 try:
-    logger.info("Initializing HuggingFaceEmbeddings...")
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    logger.info("HuggingFaceEmbeddings initialized successfully")
+    logger.info("Initializing OpenAIEmbeddings...")
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=os.getenv("OPENAI_API_KEY"))
+    logger.info("OpenAIEmbeddings initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize HuggingFaceEmbeddings: {str(e)}")
+    logger.error(f"Failed to initialize OpenAIEmbeddings: {str(e)}")
     raise RuntimeError(f"Embedding initialization failed: {str(e)}")
 
 try:
@@ -76,19 +75,19 @@ except Exception as e:
     raise RuntimeError(f"Classifier initialization failed: {str(e)}")
 
 try:
-    logger.info("Initializing HuggingFaceEndpoint...")
-    llm = HuggingFaceEndpoint(
-        repo_id="mistralai/Mistral-Nemo-Base-2407",
-        huggingfacehub_api_token=os.getenv("HUGGINGFACEHUB_API_TOKEN"),
-        max_new_tokens=512,
-        do_sample=False
+    logger.info("Initializing OpenAI LLM...")
+    llm = OpenAI(
+        model_name="gpt-3.5-turbo",
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        max_tokens=512,
+        temperature=0
     )
     # Test LLM
     test_response = llm.invoke("Test query")
-    logger.info(f"HuggingFaceEndpoint test response: {test_response}")
-    logger.info("HuggingFaceEndpoint initialized successfully")
+    logger.info(f"OpenAI LLM test response: {test_response}")
+    logger.info("OpenAI LLM initialized successfully")
 except Exception as e:
-    logger.error(f"Failed to initialize HuggingFaceEndpoint: {str(e)}")
+    logger.error(f"Failed to initialize OpenAI LLM: {str(e)}")
     raise RuntimeError(f"LLM initialization failed: {str(e)}")
 
 # Store raw files

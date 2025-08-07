@@ -5,7 +5,7 @@ venv/
 .pytest_cache/
 uploads/
 vectorstore/
-.env/
+.env
 
 # Logs
 *.log

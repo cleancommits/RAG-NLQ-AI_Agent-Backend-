@@ -1,0 +1,9 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+pandas==2.2.2
+pdfplumber==0.11.4
+langchain-openai==0.2.0
+langchain-chroma==0.1.4
+sqlalchemy==2.0.31
+transformers==4.44.2
+python-dotenv==1.0.1
