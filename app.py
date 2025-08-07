@@ -3,7 +3,7 @@ import os
 import pandas as pd
 import pdfplumber
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from langchain_openai import OpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain.chains import RetrievalQA
 from sqlalchemy import create_engine, text
@@ -76,14 +76,14 @@ except Exception as e:
 
 try:
     logger.info("Initializing OpenAI LLM...")
-    llm = OpenAI(
+    llm = ChatOpenAI(
         model_name="gpt-3.5-turbo",
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         max_tokens=512,
         temperature=0
     )
     # Test LLM
-    test_response = llm.invoke("Test query")
+    test_response = llm.invoke("Test query").content
     logger.info(f"OpenAI LLM test response: {test_response}")
     logger.info("OpenAI LLM initialized successfully")
 except Exception as e:
@@ -177,56 +177,60 @@ async def query(request: dict):
                         {"table": table}
                     ).fetchall()
                     column_info = {c[0]: c[1] for c in columns}
-                    # Prioritize 'name' or text-based columns for non-numerical searches
-                    search_term = clean_query_text.split()[-1]
-                    name_columns = [col for col in column_info if col.lower() in ('name', 'id', 'employee', 'person')]
-                    value_columns = [col for col in column_info if col.lower() in clean_query_text.lower() and col.lower() not in ('name', 'id', 'employee', 'person')]
+                    # Split query into words and find matching columns
+                    query_words = clean_query_text.lower().split()
+                    matching_columns = [col for col in column_info if any(col.lower().startswith(word) or word in col.lower() for word in query_words)]
                     
-                    # If query contains a name-like term, prioritize name-like columns
-                    if name_columns and not search_term.replace('.', '').isdigit():
-                        column = name_columns[0]
-                    elif value_columns:
-                        column = value_columns[0]
-                    else:
-                        column = list(column_info.keys())[0]  # Fallback to first column
+                    # If no matching columns, try a broader search
+                    if not matching_columns:
+                        matching_columns = list(column_info.keys())[:1]  # Fallback to first column
+                        logger.warning(f"No matching columns for query '{query_text}' in table {table}, using first column")
                     
-                    # Cast to TEXT for LIKE if column is not text-based
-                    if column_info[column].lower() not in ('text', 'varchar', 'character varying'):
-                        column_expr = f"{column}::TEXT"
-                    else:
-                        column_expr = column
-                    sql = text(f"SELECT * FROM {table} WHERE {column_expr} LIKE :search_term")
-                    try:
-                        result = conn.execute(sql, {"search_term": f"%{search_term}%"}).fetchall()
-                        logger.info(f"Executed SQL: SELECT * FROM {table} WHERE {column_expr} LIKE '%{search_term}%'")
-                        if result:
-                            # Format result as natural language using LLM
-                            result_dicts = [dict(row._mapping) for row in result]
-                            result_str = "\n".join([f"Row {i+1}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) for i, row in enumerate(result_dicts)])
-                            prompt = (
-                                f"Convert the following query result into a natural language response. "
-                                f"Be precise, but do not be overly formal. Assume the user already knows the context of the data. "
-                                f"Do not mention column names in the response. "
-                                f"Include the salary and department in the format: '<name>’s salary is <salary>, and they work in the <department> department.' "
-                                f"If multiple results are found, list each in a separate sentence. "
-                                f"Do not include any additional instructions or metadata in the response.\n\n"
-                                f"Query: {query_text}\n"
-                                f"Result:\n{result_str}"
-                            )
-                            natural_response = llm.invoke(prompt).strip()
-                            # Clean any residual metadata or instructions
-                            clean_response = re.sub(r'^(?:Be precise|[#\s]*ChatGPT.*?\n\n|\n\n.*?\n\n)?', '', natural_response, flags=re.MULTILINE).strip()
-                            return {
-                                "type": "NLQ",
-                                "result": clean_response,
-                                "sql": f"SELECT * FROM {table} WHERE {column_expr} LIKE '%{search_term}%'"
-                            }
+                    # Build SQL query to search across matching columns
+                    conditions = []
+                    params = {}
+                    for idx, column in enumerate(matching_columns):
+                        search_term = query_words[-1] if query_words else clean_query_text
+                        if column_info[column].lower() in ('text', 'varchar', 'character varying'):
+                            column_expr = column
                         else:
-                            logger.warning(f"No results found for table {table}")
+                            column_expr = f"{column}::TEXT"
+                        conditions.append(f"{column_expr} LIKE :search_term_{idx}")
+                        params[f"search_term_{idx}"] = f"%{search_term}%"
+                    
+                    if conditions:
+                        sql = text(f"SELECT * FROM {table} WHERE {' OR '.join(conditions)}")
+                        try:
+                            result = conn.execute(sql, params).fetchall()
+                            logger.info(f"Executed SQL: {sql} with params {params}")
+                            if result:
+                                # Format result as natural language using LLM
+                                result_dicts = [dict(row._mapping) for row in result]
+                                result_str = "\n".join([f"Row {i+1}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) for i, row in enumerate(result_dicts)])
+                                prompt = (
+                                    f"Convert the following query result into a natural language response. "
+                                    f"Be precise, but do not be overly formal. Assume the user already knows the context of the data. "
+                                    f"Do not mention column names in the response unless they are explicitly part of the data values. "
+                                    f"If the query seems to ask for specific fields like salary or department, include them in the format: '<name>’s salary is <salary>, and they work in the <department> department.' "
+                                    f"If multiple results are found, list each in a separate sentence. "
+                                    f"Do not include any additional instructions or metadata in the response.\n\n"
+                                    f"Query: {query_text}\n"
+                                    f"Result:\n{result_str}"
+                                )
+                                natural_response = llm.invoke(prompt).content.strip()
+                                # Clean any residual metadata or instructions
+                                clean_response = re.sub(r'^(?:Be precise|[#\s]*ChatGPT.*?\n\n|\n\n.*?\n\n)?', '', natural_response, flags=re.MULTILINE).strip()
+                                return {
+                                    "type": "NLQ",
+                                    "result": clean_response,
+                                    "sql": str(sql) + f" with params {params}"
+                                }
+                            else:
+                                logger.warning(f"No results found for table {table}")
+                                continue
+                        except ProgrammingError as e:
+                            logger.warning(f"SQL execution failed for table {table}: {str(e)}")
                             continue
-                    except ProgrammingError as e:
-                        logger.warning(f"SQL execution failed for table {table}: {str(e)}")
-                        continue
             logger.warning("NLQ failed: no matching table/column, falling back to RAG")
         except Exception as e:
             logger.error(f"NLQ error: {str(e)}, falling back to RAG")
