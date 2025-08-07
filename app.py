@@ -15,6 +15,14 @@ from dotenv import load_dotenv
 import string
 import re
 import time
+from nltk.corpus import stopwords
+import nltk
+
+# Download NLTK stopwords
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
 
 # Load environment variables
 load_dotenv()
@@ -94,6 +102,9 @@ except Exception as e:
 # Store raw files
 UPLOAD_DIR = "./Uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+# Stopwords for query filtering
+stop_words = set(stopwords.words('english'))
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -205,19 +216,24 @@ async def query(request: dict):
                     
                     # Split query into words
                     query_words = clean_query_text.lower().split()
-                    # Identify potential name-like column by checking string-type columns
+                    # Filter out stopwords and prioritize terms
+                    filtered_words = [word for word in query_words if word not in stop_words]
+                    logger.info(f"Filtered query words: {filtered_words}")
+                    
+                    # Identify name-like term (proper noun or non-stopword)
+                    search_term = next(
+                        (word for word in filtered_words if word.capitalize() == word),
+                        next((word for word in filtered_words if not word.replace('.', '').isdigit()), filtered_words[-1] if filtered_words else clean_query_text)
+                    )
+                    logger.info(f"Selected search term: {search_term}")
+                    
+                    # Identify string columns for name-like search
                     string_columns = [col for col, dtype in column_info.items() if dtype.lower() in ('text', 'varchar', 'character varying')]
                     if not string_columns:
                         logger.warning(f"No string columns in table {table}, skipping")
                         continue
                     
-                    # Check for name-like term (capitalized or non-numeric)
-                    search_term = next(
-                        (word for word in query_words if word.capitalize() == word and word not in ('of', 'the', 'in')),
-                        next((word for word in query_words if not word.replace('.', '').isdigit()), query_words[-1] if query_words else clean_query_text)
-                    )
-                    
-                    # Try to fetch sample data to identify name-like column (heuristic: high uniqueness)
+                    # Select name-like column based on uniqueness
                     try:
                         sample_data = conn.execute(text(f"SELECT * FROM {table} LIMIT 5")).fetchall()
                         sample_dicts = [dict(row._mapping) for row in sample_data]
@@ -229,11 +245,12 @@ async def query(request: dict):
                     except Exception as e:
                         logger.warning(f"Failed to fetch sample data for {table}: {str(e)}")
                         search_column = string_columns[0]
+                    logger.info(f"Selected search column: {search_column}")
                     
-                    # Identify columns to select based on query
-                    select_columns = [col for col in column_info if col.lower() in query_words and col.lower() not in ('of', 'the', 'in', search_term.lower())]
+                    # Identify columns to select (exclude search term and stopwords)
+                    select_columns = [col for col in column_info if col.lower() in filtered_words and col.lower() != search_term.lower()]
                     if not select_columns:
-                        select_columns = [col for col in column_info if col != search_column]  # Select all non-search columns
+                        select_columns = [col for col in column_info if col != search_column]
                         logger.warning(f"No matching select columns for query '{query_text}' in table {table}, selecting all non-search columns")
                     
                     # Check for ambiguity

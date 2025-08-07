@@ -7,3 +7,4 @@ langchain-chroma==0.1.4
 sqlalchemy==2.0.31
 transformers==4.44.2
 python-dotenv==1.0.1
+nltk==3.8.1
