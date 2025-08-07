@@ -14,6 +14,7 @@ import uuid
 from dotenv import load_dotenv
 import string
 import re
+import time
 
 # Load environment variables
 load_dotenv()
@@ -140,8 +141,30 @@ async def upload_file(file: UploadFile = File(...)):
     
     return {"file_id": file_id, "filename": file.filename}
 
+@app.get("/tables")
+async def get_tables():
+    try:
+        with db_engine.connect() as conn:
+            tables = conn.execute(
+                text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            ).fetchall()
+            table_info = {}
+            for table in tables:
+                table_name = table[0]
+                columns = conn.execute(
+                    text("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = :table"),
+                    {"table": table_name}
+                ).fetchall()
+                table_info[table_name] = [{"name": col[0], "type": col[1]} for col in columns]
+            logger.info(f"Retrieved table schemas: {table_info}")
+            return {"tables": table_info}
+    except Exception as e:
+        logger.error(f"Table schema retrieval error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve table schemas: {str(e)}")
+
 @app.post("/query")
 async def query(request: dict):
+    start_time = time.time()
     query_text = request.get("text")
     if not query_text:
         logger.error("Query text is missing")
@@ -154,9 +177,11 @@ async def query(request: dict):
     # Classify query
     try:
         labels = ["NLQ", "RAG"]
+        classification_start = time.time()
         classification = classifier(query_text, candidate_labels=labels)
         query_type = classification["labels"][0]
-        logger.info(f"Query classified as: {query_type}")
+        classification_latency = time.time() - classification_start
+        logger.info(f"Query classified as: {query_type} (classification latency: {classification_latency:.3f}s)")
     except Exception as e:
         logger.error(f"Query classification error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Query classification failed: {str(e)}")
@@ -177,66 +202,104 @@ async def query(request: dict):
                         {"table": table}
                     ).fetchall()
                     column_info = {c[0]: c[1] for c in columns}
-                    # Split query into words and find matching columns
+                    
+                    # Split query into words
                     query_words = clean_query_text.lower().split()
-                    matching_columns = [col for col in column_info if any(col.lower().startswith(word) or word in col.lower() for word in query_words)]
+                    # Identify potential name-like column by checking string-type columns
+                    string_columns = [col for col, dtype in column_info.items() if dtype.lower() in ('text', 'varchar', 'character varying')]
+                    if not string_columns:
+                        logger.warning(f"No string columns in table {table}, skipping")
+                        continue
                     
-                    # If no matching columns, try a broader search
-                    if not matching_columns:
-                        matching_columns = list(column_info.keys())[:1]  # Fallback to first column
-                        logger.warning(f"No matching columns for query '{query_text}' in table {table}, using first column")
+                    # Check for name-like term (capitalized or non-numeric)
+                    search_term = next(
+                        (word for word in query_words if word.capitalize() == word and word not in ('of', 'the', 'in')),
+                        next((word for word in query_words if not word.replace('.', '').isdigit()), query_words[-1] if query_words else clean_query_text)
+                    )
                     
-                    # Build SQL query to search across matching columns
-                    conditions = []
-                    params = {}
-                    for idx, column in enumerate(matching_columns):
-                        search_term = query_words[-1] if query_words else clean_query_text
-                        if column_info[column].lower() in ('text', 'varchar', 'character varying'):
-                            column_expr = column
-                        else:
-                            column_expr = f"{column}::TEXT"
-                        conditions.append(f"{column_expr} LIKE :search_term_{idx}")
-                        params[f"search_term_{idx}"] = f"%{search_term}%"
+                    # Try to fetch sample data to identify name-like column (heuristic: high uniqueness)
+                    try:
+                        sample_data = conn.execute(text(f"SELECT * FROM {table} LIMIT 5")).fetchall()
+                        sample_dicts = [dict(row._mapping) for row in sample_data]
+                        uniqueness = {}
+                        for col in string_columns:
+                            values = [row.get(col) for row in sample_dicts if col in row]
+                            uniqueness[col] = len(set(values)) / len(values) if values else 0
+                        search_column = max(uniqueness, key=uniqueness.get, default=string_columns[0]) if uniqueness else string_columns[0]
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch sample data for {table}: {str(e)}")
+                        search_column = string_columns[0]
                     
-                    if conditions:
-                        sql = text(f"SELECT * FROM {table} WHERE {' OR '.join(conditions)}")
-                        try:
-                            result = conn.execute(sql, params).fetchall()
-                            logger.info(f"Executed SQL: {sql} with params {params}")
-                            if result:
-                                # Format result as natural language using LLM
-                                result_dicts = [dict(row._mapping) for row in result]
-                                result_str = "\n".join([f"Row {i+1}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) for i, row in enumerate(result_dicts)])
-                                prompt = (
-                                    f"Convert the following query result into a natural language response. "
-                                    f"Be precise, but do not be overly formal. Assume the user already knows the context of the data. "
-                                    f"Do not mention column names in the response unless they are explicitly part of the data values. "
-                                    f"If the query seems to ask for specific fields like salary or department, include them in the format: '<name>’s salary is <salary>, and they work in the <department> department.' "
-                                    f"If multiple results are found, list each in a separate sentence. "
-                                    f"Do not include any additional instructions or metadata in the response.\n\n"
-                                    f"Query: {query_text}\n"
-                                    f"Result:\n{result_str}"
-                                )
-                                natural_response = llm.invoke(prompt).content.strip()
-                                # Clean any residual metadata or instructions
-                                clean_response = re.sub(r'^(?:Be precise|[#\s]*ChatGPT.*?\n\n|\n\n.*?\n\n)?', '', natural_response, flags=re.MULTILINE).strip()
-                                return {
-                                    "type": "NLQ",
-                                    "result": clean_response,
-                                    "sql": str(sql) + f" with params {params}"
+                    # Identify columns to select based on query
+                    select_columns = [col for col in column_info if col.lower() in query_words and col.lower() not in ('of', 'the', 'in', search_term.lower())]
+                    if not select_columns:
+                        select_columns = [col for col in column_info if col != search_column]  # Select all non-search columns
+                        logger.warning(f"No matching select columns for query '{query_text}' in table {table}, selecting all non-search columns")
+                    
+                    # Check for ambiguity
+                    if len(string_columns) > 1 and not select_columns:
+                        logger.warning(f"Ambiguous query for table {table}: multiple string columns {string_columns}")
+                        return {
+                            "type": "clarification_needed",
+                            "result": f"Multiple columns could match your query. Please specify which columns to search or select from: {string_columns}",
+                            "table": table
+                        }
+                    
+                    # Build SQL query
+                    select_expr = ', '.join(select_columns) if select_columns else '*'
+                    column_expr = search_column if column_info[search_column].lower() in ('text', 'varchar', 'character varying') else f"{search_column}::TEXT"
+                    sql = text(f"SELECT {select_expr} FROM {table} WHERE {column_expr} LIKE :search_term")
+                    params = {"search_term": f"%{search_term}%"}
+                    sql_start = time.time()
+                    try:
+                        result = conn.execute(sql, params).fetchall()
+                        sql_latency = time.time() - sql_start
+                        logger.info(f"Executed SQL: SELECT {select_expr} FROM {table} WHERE {column_expr} LIKE '%{search_term}%' (latency: {sql_latency:.3f}s)")
+                        if result:
+                            # Format result as natural language using LLM
+                            result_dicts = [dict(row._mapping) for row in result]
+                            result_str = "\n".join([f"Row {i+1}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) for i, row in enumerate(result_dicts)])
+                            prompt = (
+                                f"Convert the following query result into a natural language response. "
+                                f"Be precise, but do not be overly formal. Assume the user already knows the context of the data. "
+                                f"Do not mention column names in the response unless they are explicitly part of the data values. "
+                                f"If the query seems to ask for specific fields like salary or department, include them in the format: '<name>’s salary is <salary>, and they work in the <department> department.' "
+                                f"If multiple results are found, list each in a separate sentence. "
+                                f"Do not include any additional instructions or metadata in the response.\n\n"
+                                f"Query: {query_text}\n"
+                                f"Result:\n{result_str}"
+                            )
+                            llm_start = time.time()
+                            natural_response = llm.invoke(prompt).content.strip()
+                            llm_latency = time.time() - llm_start
+                            # Clean any residual metadata or instructions
+                            clean_response = re.sub(r'^(?:Be precise|[#\s]*ChatGPT.*?\n\n|\n\n.*?\n\n)?', '', natural_response, flags=re.MULTILINE).strip()
+                            total_latency = time.time() - start_time
+                            logger.info(f"NLQ response generated (LLM latency: {llm_latency:.3f}s, total latency: {total_latency:.3f}s)")
+                            return {
+                                "type": "NLQ",
+                                "result": clean_response,
+                                "sql": str(sql) + f" with params {params}",
+                                "latency": {
+                                    "classification": classification_latency,
+                                    "sql": sql_latency,
+                                    "llm": llm_latency,
+                                    "total": total_latency
                                 }
-                            else:
-                                logger.warning(f"No results found for table {table}")
-                                continue
-                        except ProgrammingError as e:
-                            logger.warning(f"SQL execution failed for table {table}: {str(e)}")
+                            }
+                        else:
+                            logger.warning(f"No results found for table {table}")
                             continue
+                    except ProgrammingError as e:
+                        logger.warning(f"SQL execution failed for table {table}: {str(e)}")
+                        continue
             logger.warning("NLQ failed: no matching table/column, falling back to RAG")
         except Exception as e:
             logger.error(f"NLQ error: {str(e)}, falling back to RAG")
     
     # RAG pipeline
     try:
+        rag_start = time.time()
         qa_chain = RetrievalQA.from_chain_type(
             llm=llm,
             chain_type="stuff",
@@ -244,12 +307,19 @@ async def query(request: dict):
             return_source_documents=True
         )
         result = qa_chain.invoke({"query": query_text})
+        rag_latency = time.time() - rag_start
         cleaned_result = result['result'].replace('^"|"', '').strip()
-        logger.info(f"RAG result: {cleaned_result}")
+        total_latency = time.time() - start_time
+        logger.info(f"RAG result: {cleaned_result} (RAG latency: {rag_latency:.3f}s, total latency: {total_latency:.3f}s)")
         return {
             "type": "RAG",
             "result": cleaned_result,
-            "source_documents": [doc.metadata for doc in result["source_documents"]]
+            "source_documents": [doc.metadata for doc in result["source_documents"]],
+            "latency": {
+                "classification": classification_latency,
+                "rag": rag_latency,
+                "total": total_latency
+            }
         }
     except Exception as e:
         logger.error(f"RAG error: {str(e)}")
