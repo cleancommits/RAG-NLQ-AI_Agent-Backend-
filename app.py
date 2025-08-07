@@ -23,11 +23,11 @@ from nltk.tag import pos_tag
 # Download NLTK resources
 try:
     nltk.data.find('corpora/stopwords')
-    nltk.data.find('tokenizers/punkt_tab')
+    nltk.data.find('tokenizers/punkt')
     nltk.data.find('taggers/averaged_perceptron_tagger')
 except LookupError:
     nltk.download('stopwords')
-    nltk.download('punkt_tab')
+    nltk.download('punkt')
     nltk.download('averaged_perceptron_tagger')
 
 # Load environment variables
@@ -43,10 +43,10 @@ app = FastAPI()
 @app.get("/")
 def read_root():
     return {"message": "Hello from FastAPI"}
-    
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rag-nlq-ai-agent.vercel.app"],
+    allow_origins=["https://rag-nlq-ai-agent.vercel.app", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
