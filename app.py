@@ -40,6 +40,10 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
+@app.get("/")
+def read_root():
+    return {"message": "Hello from FastAPI"}
+    
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://rag-nlq-ai-agent.vercel.app"],
