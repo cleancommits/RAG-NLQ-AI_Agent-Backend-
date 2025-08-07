@@ -15,14 +15,20 @@ from dotenv import load_dotenv
 import string
 import re
 import time
-from nltk.corpus import stopwords
 import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.tag import pos_tag
 
-# Download NLTK stopwords
+# Download NLTK resources
 try:
     nltk.data.find('corpora/stopwords')
+    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('taggers/averaged_perceptron_tagger')
 except LookupError:
     nltk.download('stopwords')
+    nltk.download('punkt')
+    nltk.download('averaged_perceptron_tagger')
 
 # Load environment variables
 load_dotenv()
@@ -103,8 +109,8 @@ except Exception as e:
 UPLOAD_DIR = "./Uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Stopwords for query filtering
-stop_words = set(stopwords.words('english'))
+# Stopwords
+stop_words = set(stopwords.words('english')).union({'of', 'the', 'in', 'about', 'tell', 'me'})
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -199,6 +205,23 @@ async def query(request: dict):
     
     if query_type == "NLQ":
         try:
+            # Process query with NLTK
+            tokens = word_tokenize(query_text)
+            # Handle possessive forms (e.g., "Alice's" -> "Alice")
+            tokens = [token[:-2] if token.endswith("'s") else token for token in tokens]
+            # POS tagging
+            pos_tags = pos_tag(tokens)
+            # Filter tokens: keep proper nouns (NNP), nouns (NN), and exclude stopwords
+            filtered_tokens = [word for word, pos in pos_tags if pos in ('NNP', 'NN') and word.lower() not in stop_words]
+            logger.info(f"Filtered query tokens: {filtered_tokens}")
+            
+            # Prioritize proper nouns for search term
+            search_term = next(
+                (word for word, pos in pos_tags if pos == 'NNP' and word.lower() not in stop_words),
+                next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
+            )
+            logger.info(f"Selected search term: {search_term}")
+            
             # Get tables
             with db_engine.connect() as conn:
                 tables = conn.execute(
@@ -213,19 +236,6 @@ async def query(request: dict):
                         {"table": table}
                     ).fetchall()
                     column_info = {c[0]: c[1] for c in columns}
-                    
-                    # Split query into words
-                    query_words = clean_query_text.lower().split()
-                    # Filter out stopwords and prioritize terms
-                    filtered_words = [word for word in query_words if word not in stop_words]
-                    logger.info(f"Filtered query words: {filtered_words}")
-                    
-                    # Identify name-like term (proper noun or non-stopword)
-                    search_term = next(
-                        (word for word in filtered_words if word.capitalize() == word),
-                        next((word for word in filtered_words if not word.replace('.', '').isdigit()), filtered_words[-1] if filtered_words else clean_query_text)
-                    )
-                    logger.info(f"Selected search term: {search_term}")
                     
                     # Identify string columns for name-like search
                     string_columns = [col for col, dtype in column_info.items() if dtype.lower() in ('text', 'varchar', 'character varying')]
@@ -247,8 +257,8 @@ async def query(request: dict):
                         search_column = string_columns[0]
                     logger.info(f"Selected search column: {search_column}")
                     
-                    # Identify columns to select (exclude search term and stopwords)
-                    select_columns = [col for col in column_info if col.lower() in filtered_words and col.lower() != search_term.lower()]
+                    # Identify columns to select (match filtered tokens to column names)
+                    select_columns = [col for col in column_info if col.lower() in [t.lower() for t in filtered_tokens] and col.lower() != search_term.lower()]
                     if not select_columns:
                         select_columns = [col for col in column_info if col != search_column]
                         logger.warning(f"No matching select columns for query '{query_text}' in table {table}, selecting all non-search columns")
