@@ -1,0 +1,12 @@
+# Python specific (if backend is Python)
+__pycache__/
+*.pyc
+venv/
+.pytest_cache/
+uploads/
+vectorstore/
+.env/
+
+# Logs
+*.log
+
