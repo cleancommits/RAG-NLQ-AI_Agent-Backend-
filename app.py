@@ -23,11 +23,11 @@ from nltk.tag import pos_tag
 # Download NLTK resources
 try:
     nltk.data.find('corpora/stopwords')
-    nltk.data.find('tokenizers/punkt')
+    nltk.data.find('tokenizers/punkt_tab')
     nltk.data.find('taggers/averaged_perceptron_tagger')
 except LookupError:
     nltk.download('stopwords')
-    nltk.download('punkt')
+    nltk.download('punkt_tab')
     nltk.download('averaged_perceptron_tagger')
 
 # Load environment variables
@@ -206,21 +206,33 @@ async def query(request: dict):
     if query_type == "NLQ":
         try:
             # Process query with NLTK
-            tokens = word_tokenize(query_text)
-            # Handle possessive forms (e.g., "Alice's" -> "Alice")
-            tokens = [token[:-2] if token.endswith("'s") else token for token in tokens]
-            # POS tagging
-            pos_tags = pos_tag(tokens)
-            # Filter tokens: keep proper nouns (NNP), nouns (NN), and exclude stopwords
-            filtered_tokens = [word for word, pos in pos_tags if pos in ('NNP', 'NN') and word.lower() not in stop_words]
-            logger.info(f"Filtered query tokens: {filtered_tokens}")
-            
-            # Prioritize proper nouns for search term
-            search_term = next(
-                (word for word, pos in pos_tags if pos == 'NNP' and word.lower() not in stop_words),
-                next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
-            )
-            logger.info(f"Selected search term: {search_term}")
+            try:
+                tokens = word_tokenize(query_text)
+                # Handle possessive forms (e.g., "Alice's" -> "Alice")
+                tokens = [token[:-2] if token.endswith("'s") else token for token in tokens]
+                # POS tagging
+                pos_tags = pos_tag(tokens)
+                # Filter tokens: keep proper nouns (NNP), nouns (NN), and exclude stopwords
+                filtered_tokens = [word for word, pos in pos_tags if pos in ('NNP', 'NN') and word.lower() not in stop_words]
+                logger.info(f"Filtered query tokens: {filtered_tokens}")
+                
+                # Prioritize proper nouns for search term
+                search_term = next(
+                    (word for word, pos in pos_tags if pos == 'NNP' and word.lower() not in stop_words),
+                    next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
+                )
+                logger.info(f"Selected search term: {search_term}")
+            except Exception as e:
+                logger.warning(f"NLTK processing failed: {str(e)}, falling back to basic tokenization")
+                # Fallback to basic tokenization
+                tokens = clean_query_text.split()
+                tokens = [token[:-2] if token.endswith("s") else token for token in tokens]  # Handle possessive
+                filtered_tokens = [word for word in tokens if word.lower() not in stop_words]
+                search_term = next(
+                    (word for word in filtered_tokens if word[0].isupper()),
+                    next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
+                )
+                logger.info(f"Fallback filtered tokens: {filtered_tokens}, search term: {search_term}")
             
             # Get tables
             with db_engine.connect() as conn:
