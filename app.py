@@ -247,9 +247,10 @@ def run_nlq_on_postgres(query: str) -> tuple[List[Dict], List[Dict]]:
         logger.debug(f"Generating SQL for table: {table_name}, columns: {columns}")
         prompt = f"""
             You are a PostgreSQL expert. Generate a valid PostgreSQL query for:
-            Table: {table_name}
+            Table: "{table_name}"
             Columns: {columns}
             Query: {query}
+            IMPORTANT: Always enclose table names and column names in double quotes to preserve case sensitivity and handle special characters.
             Return JSON with:
             - sql: the SQL query
             - confidence: float between 0 and 1
