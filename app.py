@@ -14,6 +14,7 @@ from datetime import datetime
 import json
 from dotenv import load_dotenv
 import io
+import pdfplumber
 from collections import Counter
 
 # Configure logging with detailed format
@@ -48,7 +49,7 @@ app.add_middleware(
 )
 
 # In-memory tracking
-pdf_docs = []
+pdf_docs = []  # List of {filename: str, content: str}
 csv_tables = {}  # {table_name: {columns: [], metadata: {}}}
 query_history = []
 
@@ -77,58 +78,72 @@ def sanitize_table_name(name: str) -> str:
         name = "_" + name
     return name[:63]
 
-def generate_natural_language_response(query: str, results: List[Dict]) -> str:
-    """Generate a concise, natural language response from query results (max 200-300 words)."""
-    if not results or not any(r.get("rows") for r in results):
-        logger.debug("No results to format for query")
-        return "No relevant data found for your query."
-
-    # Prepare raw result summary for OpenAI
-    raw_summary = []
-    for result in results:
-        table = result.get("table", "Unknown")
-        columns = result.get("columns", [])
-        rows = result.get("rows", [])
-        if not rows:
-            continue
-        raw_summary.append(f"Table: {table}\nColumns: {', '.join(columns)}\nRows (up to 10):\n" +
-                          "\n".join([" | ".join(str(x) for x in row) for row in rows[:10]]))
-
-    combined = "\n\n".join(raw_summary) if raw_summary else "No data available."
-    
-    # Check if query is about clustering
+def generate_natural_language_response(query: str, results: List[Dict] = None, pdf_content: List[Dict] = None) -> str:
+    """Generate a concise, natural language response from query results or PDF content (max 200-300 words)."""
     is_clustering_query = "cluster" in query.lower() and "queries" in query.lower()
-    
-    if is_clustering_query:
-        # Simple keyword-based clustering
-        all_queries = []
-        for result in results:
-            rows = result.get("rows", [])
-            for row in rows:
-                query_text = row[0] if row else ""  # Assume "Top queries" is first column
-                if query_text and isinstance(query_text, str):
-                    words = query_text.lower().split()
-                    all_queries.extend(words)
+    is_rag = pdf_content is not None
+
+    if is_rag:
+        if not pdf_content:
+            logger.debug("No PDF content available for RAG query")
+            return "No relevant PDF data found for your query. Please upload a relevant PDF."
         
-        # Count common keywords
-        keyword_counts = Counter(all_queries)
-        top_keywords = [word for word, count in keyword_counts.most_common(5) if len(word) > 3]
-        cluster_summary = f"Top query clusters based on keywords: {', '.join(top_keywords)}." if top_keywords else "No distinct query clusters found."
-
+        # Combine PDF content
+        combined = "\n\n".join([f"From {doc['filename']}:\n{doc['content'][:1000]}" for doc in pdf_content])
+        if not combined:
+            logger.debug("Empty PDF content for RAG query")
+            return "No relevant PDF data found for your query."
+        
+        prompt = f"""
+            Summarize the following PDF content in response to the query in concise, natural language (150-250 words, max 300).
+            - Query: {query}
+            - Content: {combined[:4000]}  # Limit to avoid token overflow
+            - Avoid technical jargon and focus on answering the query directly.
+            - If no relevant content, say so clearly and suggest checking data sources.
+            """
     else:
-        cluster_summary = ""
+        if not results or not any(r.get("rows") for r in results):
+            logger.debug("No results to format for query")
+            return "No relevant data found for your query."
 
-    # Generate natural language response
-    prompt = f"""
-        Summarize the following query results in concise, natural language (150-250 words, max 450 have to answer done with in the max word).
-        - Query: {query}
-        - Data: {combined}
-        - {cluster_summary if is_clustering_query else "Focus on the most relevant data (e.g., top 10 queries by clicks for 'top queries' requests)."}
-        - Avoid technical jargon and raw table formats.
-        - For clustering queries, describe top clusters by topic or keyword.
-        - If no data, say so clearly and suggest checking data sources.
-        """
-    
+        # Prepare raw result summary for NLQ
+        raw_summary = []
+        for result in results:
+            table = result.get("table", "Unknown")
+            columns = result.get("columns", [])
+            rows = result.get("rows", [])
+            if not rows:
+                continue
+            raw_summary.append(f"Table: {table}\nColumns: {', '.join(columns)}\nRows (up to 10):\n" +
+                              "\n".join([" | ".join(str(x) for x in row) for row in rows[:10]]))
+
+        combined = "\n\n".join(raw_summary) if raw_summary else "No data available."
+        
+        # Keyword-based clustering for NLQ clustering queries
+        cluster_summary = ""
+        if is_clustering_query:
+            all_queries = []
+            for result in results:
+                rows = result.get("rows", [])
+                for row in rows:
+                    query_text = row[0] if row else ""
+                    if query_text and isinstance(query_text, str):
+                        words = query_text.lower().split()
+                        all_queries.extend(words)
+            keyword_counts = Counter(all_queries)
+            top_keywords = [word for word, count in keyword_counts.most_common(5) if len(word) > 3]
+            cluster_summary = f"Top query clusters based on keywords: {', '.join(top_keywords)}." if top_keywords else "No distinct query clusters found."
+
+        prompt = f"""
+            Summarize the following query results in concise, natural language (150-250 words, max 400, the answer have to done in the max words).
+            - Query: {query}
+            - Data: {combined}
+            - {cluster_summary if is_clustering_query else "Focus on the most relevant data (e.g., top 10 queries by clicks for 'top queries' requests)."}
+            - Avoid technical jargon and raw table formats.
+            - For clustering queries, describe top clusters by topic or keyword.
+            - If no data, say so clearly and suggest checking data sources.
+            """
+
     try:
         resp = client.chat.completions.create(
             model="gpt-4o",
@@ -177,7 +192,7 @@ def route_query(query: str) -> Dict:
         RULES:
         1. If the query is about counts, sums, averages, rankings, numeric values, statistics, reports, metrics, salaries, revenues, clusters, or other structured data that could be stored in the above tables — classify as NLQ.
         2. Even if the query mentions a person's name or entity, if it is asking for a measurable numeric value (e.g., "Alice's salary", "Bob's sales total") — classify as NLQ.
-        3. Only classify as RAG if the answer clearly cannot come from structured data.
+        3. Only classify as RAG if the answer clearly cannot come from structured data or involves general knowledge (e.g., "tell me about").
 
         Return JSON with:
         - decision: "NLQ" or "RAG"
@@ -367,14 +382,19 @@ def rag_fallback_for_csv(query: str) -> List[Dict]:
                 conn.close()
     
     combined = "\n\n".join([d["content"] for d in text_data]) or "No CSV content available."
-    return [{"answer": f"RAG fallback for CSV: {query}\n\n{combined}"}]
+    return [{"answer": generate_natural_language_response(query, pdf_content=[{"filename": "CSV data", "content": combined}]) }]
 
 # ---------------------------
-# PDF RAG (Placeholder)
+# PDF RAG
 # ---------------------------
 def run_pdf_rag(query: str) -> str:
+    """Process query against uploaded PDF content using RAG."""
     logger.info(f"Running PDF RAG for query: {query}")
-    return f"PDF RAG answer for: {query} (Integrated with existing RAG pipeline)"
+    if not pdf_docs:
+        logger.debug("No PDFs available for RAG query")
+        return generate_natural_language_response(query, pdf_content=[])
+    
+    return generate_natural_language_response(query, pdf_content=pdf_docs)
 
 # ---------------------------
 # API Endpoints
@@ -392,9 +412,37 @@ async def upload_files(files: List[UploadFile] = File(...)):
         logger.info(f"Processing upload: filename={filename}, content_type={file.content_type}")
         
         if filename.lower().endswith(".pdf"):
-            pdf_docs.append(filename)
-            response["pdfs"].append(filename)
-            logger.info(f"Registered PDF file: {filename}")
+            try:
+                content = await file.read()
+                logger.debug(f"Read {len(content)} bytes from PDF: {filename}")
+                if len(content) == 0:
+                    logger.error(f"Empty PDF file: {filename}")
+                    raise ValueError(f"PDF {filename} is empty")
+                
+                # Extract text from PDF
+                try:
+                    with pdfplumber.open(io.BytesIO(content)) as pdf:
+                        text = ""
+                        for page in pdf.pages:
+                            page_text = page.extract_text()
+                            if page_text:
+                                text += page_text + "\n"
+                        if not text.strip():
+                            logger.warning(f"No text extracted from PDF: {filename}")
+                            text = "No readable content in PDF."
+                except Exception as e:
+                    logger.error(f"Failed to extract text from PDF {filename}: {str(e)}")
+                    raise HTTPException(status_code=422, detail=f"Failed to process PDF {filename}: {str(e)}")
+                
+                pdf_docs.append({"filename": filename, "content": text})
+                response["pdfs"].append(filename)
+                logger.info(f"Registered PDF file: {filename} with {len(text)} characters extracted")
+            except ValueError as ve:
+                logger.error(f"Validation error for PDF {filename}: {str(ve)}")
+                raise HTTPException(status_code=422, detail=f"Failed to process PDF {filename}: {str(ve)}")
+            finally:
+                await file.close()
+                logger.debug(f"Closed file: {filename}")
         elif filename.lower().endswith((".csv", ".tsv")):
             try:
                 content = await file.read()
@@ -531,9 +579,9 @@ async def ask_query(body: QueryRequest):
 
         response_payload.update({
             "type": "RAG",
-            "result": json.dumps(rag_answer) if isinstance(rag_answer, (dict, list)) else str(rag_answer),
+            "result": rag_answer[0]["answer"],
             "sql": None,
-            "source_documents": list(pdf_docs),
+            "source_documents": list(d["filename"] for d in pdf_docs),
             "latency": {"total": (datetime.utcnow() - start_time).total_seconds()}
         })
         return response_payload
@@ -546,7 +594,7 @@ async def ask_query(body: QueryRequest):
         "type": "RAG",
         "result": rag_answer,
         "sql": None,
-        "source_documents": list(pdf_docs),
+        "source_documents": list(d["filename"] for d in pdf_docs),
         "latency": {"total": (datetime.utcnow() - start_time).total_seconds()}
     })
     logger.info(f"Query {query_id} processed via RAG")
@@ -556,4 +604,4 @@ async def ask_query(body: QueryRequest):
 async def get_logs():
     """Return query history and logs."""
     logger.info("Retrieved logs endpoint")
-    return {"query_history": query_history, "csv_tables": csv_tables, "pdf_docs": pdf_docs}
+    return {"query_history": query_history, "csv_tables": csv_tables, "pdf_docs": list(d["filename"] for d in pdf_docs)}
