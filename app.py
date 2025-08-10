@@ -3,10 +3,10 @@ import re
 import pandas as pd
 import psycopg2
 from psycopg2.extras import execute_values
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Dict
+from pydantic import BaseModel, model_validator
+from typing import List, Dict, Optional
 from openai import OpenAI
 import logging
 import uuid
@@ -34,6 +34,7 @@ if not OPENAI_API_KEY or not POSTGRES_URL:
     logger.error("Missing required environment variables: OPENAI_API_KEY or DATABASE_URL")
     raise RuntimeError("Required environment variables (OPENAI_API_KEY, DATABASE_URL) not set")
 
+# Note: instantiate OpenAI client according to your SDK usage
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
@@ -52,10 +53,20 @@ csv_tables = {}  # {table_name: {columns: [], metadata: {}}}
 query_history = []
 
 # ---------------------------
-# Pydantic Model for Query
+# Pydantic Model for Query (accepts either "query" or "text")
 # ---------------------------
 class QueryRequest(BaseModel):
-    query: str
+    query: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def ensure_query_or_text(self):
+        if not (self.query and self.query.strip()) and not (self.text and self.text.strip()):
+            raise ValueError("Either 'query' or 'text' must be provided and non-empty.")
+        return self
+
+    def get_query_text(self) -> str:
+        return (self.query or self.text or "").strip()
 
 # ---------------------------
 # Utility Functions
@@ -97,7 +108,7 @@ def format_query_results(results: List[Dict]) -> str:
 # Enhanced Query Routing
 # ---------------------------
 def route_query(query: str) -> Dict:
-    """Enhanced query router using GPT-4 with confidence scoring."""
+    """Enhanced query router using GPT-4 with confidence scoring. Defensive: fallback if model fails."""
     logger.debug(f"Routing query: {query}")
     prompt = f"""
 Classify this query into one of two categories:
@@ -119,11 +130,8 @@ Query: {query}
         )
         result = json.loads(resp.choices[0].message.content.strip())
         if result.get("decision") not in ("NLQ", "RAG"):
-            result = {
-                "decision": "RAG",
-                "confidence": 0.5,
-                "reasoning": "Invalid classification, defaulting to RAG"
-            }
+            logger.warning("Model returned invalid decision, defaulting to RAG")
+            return {"decision": "RAG", "confidence": 0.5, "reasoning": "Invalid classification, defaulting to RAG"}
         logger.info(f"Query routing result: {query} -> {result}")
         return result
     except Exception as e:
@@ -145,8 +153,8 @@ def save_csv_to_postgres(table_name: str, df: pd.DataFrame, filename: str) -> Di
     metadata = {
         "filename": filename,
         "upload_time": datetime.utcnow().isoformat(),
-        "row_count": len(df),
-        "column_count": len(df.columns)
+        "row_count": int(len(df)),
+        "column_count": int(len(df.columns))
     }
 
     try:
@@ -154,21 +162,24 @@ def save_csv_to_postgres(table_name: str, df: pd.DataFrame, filename: str) -> Di
         cur = conn.cursor()
         logger.debug(f"Connected to PostgreSQL for table: {table_name}")
 
+        # Drop/create table (simple approach)
         cur.execute(f'DROP TABLE IF EXISTS "{table_name}";')
         logger.debug(f"Dropped existing table: {table_name}")
 
-        col_defs = ", ".join([f'"{col}" TEXT' for col in df.columns])
+        # Ensure column names are strings and unique
+        cols = [str(c) for c in df.columns]
+        col_defs = ", ".join([f'"{col}" TEXT' for col in cols])
         cur.execute(f'CREATE TABLE "{table_name}" ({col_defs});')
-        logger.debug(f"Created table {table_name} with columns: {df.columns.tolist()}")
+        logger.debug(f"Created table {table_name} with columns: {cols}")
 
-        cols = ",".join([f'"{c}"' for c in df.columns])
+        columns_sql = ",".join([f'"{c}"' for c in cols])
         values = [tuple(str(x) if pd.notnull(x) else "" for x in row) for row in df.to_numpy()]
-        insert_sql = f'INSERT INTO "{table_name}" ({cols}) VALUES %s'
+        insert_sql = f'INSERT INTO "{table_name}" ({columns_sql}) VALUES %s'
         execute_values(cur, insert_sql, values)
         conn.commit()
         logger.info(f"Successfully inserted {len(values)} rows into table: {table_name}")
 
-        csv_tables[table_name] = {"columns": list(df.columns), "metadata": metadata}
+        csv_tables[table_name] = {"columns": list(cols), "metadata": metadata}
         return {"status": "success", "table_name": table_name, "metadata": metadata}
     except Exception as e:
         logger.error(f"Failed to save CSV {filename} to PostgreSQL: {str(e)}")
@@ -202,6 +213,7 @@ Return JSON with:
 - confidence: float between 0 and 1
 - reasoning: brief explanation
 """
+        sql_query = ""
         try:
             resp = client.chat.completions.create(
                 model="gpt-4o",
@@ -214,11 +226,14 @@ Return JSON with:
             sql_logs.append({
                 "table": table_name,
                 "sql": sql_query,
-                "confidence": sql_result.get("confidence", 0.5),
+                "confidence": float(sql_result.get("confidence", 0.5)),
                 "reasoning": sql_result.get("reasoning", "")
             })
             logger.debug(f"Generated SQL for {table_name}: {sql_query}")
             
+            if not sql_query:
+                raise ValueError("Generated empty SQL query")
+
             conn = psycopg2.connect(POSTGRES_URL)
             cur = conn.cursor()
             cur.execute(sql_query)
@@ -228,6 +243,7 @@ Return JSON with:
                 results.append({"table": table_name, "columns": colnames, "rows": rows})
                 logger.info(f"NLQ executed successfully for {table_name}: {len(rows)} rows returned")
             except psycopg2.ProgrammingError:
+                # No rows to fetch (e.g., command was DDL)
                 results.append({"table": table_name, "columns": [], "rows": []})
                 logger.debug(f"No rows returned for {table_name}")
             cur.close()
@@ -268,7 +284,8 @@ def rag_fallback_for_csv(query: str) -> List[Dict]:
                 conn.close()
     
     # TODO: Integrate with actual RAG pipeline
-    return [{"answer": f"RAG fallback for CSV: {query}\n" + "\n".join([d["content"] for d in text_data])}]
+    combined = "\n\n".join([d["content"] for d in text_data]) or "No CSV content available."
+    return [{"answer": f"RAG fallback for CSV: {query}\n\n{combined}"}]
 
 # ---------------------------
 # PDF RAG (Placeholder)
@@ -290,7 +307,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
     response = {"message": "Files uploaded successfully", "tables": [], "pdfs": []}
     for file in files:
         filename = file.filename or f"file_{uuid.uuid4()}"
-        logger.info(f"Processing upload: filename={filename}, size={file.size}, content_type={file.content_type}")
+        logger.info(f"Processing upload: filename={filename}, content_type={file.content_type}")
         
         if filename.lower().endswith(".pdf"):
             pdf_docs.append(filename)
@@ -299,16 +316,13 @@ async def upload_files(files: List[UploadFile] = File(...)):
             # TODO: Integrate with PDF RAG ingestion
         elif filename.lower().endswith((".csv", ".tsv")):
             try:
-                # Read file content into memory
                 content = await file.read()
                 logger.debug(f"Read {len(content)} bytes from {filename}")
                 
-                # Validate file size
                 if len(content) == 0:
                     logger.error(f"Empty file: {filename}")
                     raise ValueError(f"File {filename} is empty")
                 
-                # Attempt to read CSV with multiple encodings
                 encodings = ['utf-8', 'latin1', 'iso-8859-1', 'utf-16']
                 df = None
                 for encoding in encodings:
@@ -328,18 +342,15 @@ async def upload_files(files: List[UploadFile] = File(...)):
                     logger.error(f"Failed to parse {filename} with any encoding")
                     raise ValueError(f"Cannot parse CSV/TSV file: {filename}")
                 
-                # Validate CSV structure
                 if df.empty or len(df.columns) == 0:
                     logger.error(f"Empty or invalid CSV: {filename}")
                     raise ValueError(f"Empty or invalid CSV: {filename}")
                 
-                # Check for consistent row lengths
                 row_lengths = df.apply(lambda row: len(row), axis=1)
                 if not (row_lengths == row_lengths.iloc[0]).all():
                     logger.error(f"Inconsistent row lengths in {filename}")
                     raise ValueError(f"CSV {filename} has inconsistent row lengths")
                 
-                # Log first few rows for debugging
                 logger.debug(f"CSV {filename} head (first 3 rows):\n{df.head(3).to_string()}")
                 
                 table_name = sanitize_table_name(os.path.splitext(filename)[0])
@@ -361,49 +372,110 @@ async def upload_files(files: List[UploadFile] = File(...)):
     logger.info(f"Upload completed: {len(response['tables'])} tables, {len(response['pdfs'])} PDFs")
     return response
 
+@app.get("/tables")
+async def get_tables():
+    """Return simplified table schema info for the frontend."""
+    logger.info("Tables schema requested")
+    return {"tables": csv_tables}
+
 @app.post("/query")
-async def ask_query(req: QueryRequest):
+async def ask_query(body: QueryRequest):
     """Handle user queries with routing between NLQ and RAG."""
-    if not req.query or not req.query.strip():
+    try:
+        query_text = body.get_query_text()
+    except Exception as e:
+        logger.error(f"Bad request body for /query: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
+
+    if not query_text:
         logger.error("Empty query received")
         raise HTTPException(status_code=400, detail="Query cannot be empty")
-    
+
     query_id = str(uuid.uuid4())
-    logger.info(f"Processing query {query_id}: {req.query}")
-    routing = route_query(req.query)
+    start_time = datetime.utcnow()
+    logger.info(f"Processing query {query_id}: {query_text}")
+
+    routing = route_query(query_text)
     logs = {
         "query_id": query_id,
-        "query": req.query,
+        "query": query_text,
         "timestamp": datetime.utcnow().isoformat(),
         "routing": routing
     }
-    
-    if routing["decision"] == "NLQ" and csv_tables:
-        results, sql_logs = run_nlq_on_postgres(req.query)
+
+    # Default response shape expected by your frontend
+    response_payload = {
+        "type": None,
+        "result": None,
+        "sql": None,
+        "source_documents": [],
+        "latency": {}
+    }
+
+    # NLQ path
+    if routing.get("decision") == "NLQ" and csv_tables:
+        results, sql_logs = run_nlq_on_postgres(query_text)
         logs["sql_logs"] = sql_logs
         non_empty = [r for r in results if r.get("rows")]
-        
+
         if non_empty:
             formatted_answer = format_query_results(non_empty)
             logs["source"] = "NLQ"
             query_history.append(logs)
+
+            # Choose first SQL from logs if present
+            first_sql = None
+            for s in sql_logs:
+                if s.get("sql"):
+                    first_sql = s.get("sql")
+                    break
+
+            response_payload.update({
+                "type": "NLQ",
+                "result": formatted_answer,
+                "sql": first_sql,
+                "source_documents": [],  # NLQ returns table data; can include table names if needed
+                "latency": {
+                    "total": (datetime.utcnow() - start_time).total_seconds()
+                }
+            })
             logger.info(f"Query {query_id} processed via NLQ: {len(non_empty)} tables with results")
-            return {"answer": formatted_answer, "logs": logs}
-        
+            return response_payload
+
+        # fall back to RAG for CSVs
         logs["fallback_reason"] = "No valid NLQ results"
         logger.warning(f"Falling back to RAG for query {query_id}")
-        answer = rag_fallback_for_csv(req.query)
+        rag_answer = rag_fallback_for_csv(query_text)
         logs["source"] = "RAG_FALLBACK"
-    else:
-        answer = run_pdf_rag(req.query)
-        logs["source"] = "RAG"
-        logger.info(f"Query {query_id} processed via RAG")
-    
+        query_history.append(logs)
+
+        response_payload.update({
+            "type": "RAG",
+            "result": json.dumps(rag_answer) if isinstance(rag_answer, (dict, list)) else str(rag_answer),
+            "sql": None,
+            "source_documents": list(pdf_docs),
+            "latency": {"total": (datetime.utcnow() - start_time).total_seconds()}
+        })
+        return response_payload
+
+    # RAG path (including when routing decision is RAG)
+    rag_answer = run_pdf_rag(query_text)
+    logs["source"] = "RAG"
     query_history.append(logs)
-    return {"answer": answer, "logs": logs}
+
+    response_payload.update({
+        "type": "RAG",
+        "result": rag_answer,
+        "sql": None,
+        "source_documents": list(pdf_docs),
+        "latency": {"total": (datetime.utcnow() - start_time).total_seconds()}
+    })
+    logger.info(f"Query {query_id} processed via RAG")
+    return response_payload
 
 @app.get("/logs")
 async def get_logs():
     """Return query history and logs."""
     logger.info("Retrieved logs endpoint")
+    # Ensure everything serializable
     return {"query_history": query_history, "csv_tables": csv_tables, "pdf_docs": pdf_docs}
