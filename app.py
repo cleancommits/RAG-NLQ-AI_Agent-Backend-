@@ -14,6 +14,7 @@ from datetime import datetime
 import json
 from dotenv import load_dotenv
 import io
+from collections import Counter
 
 # Configure logging with detailed format
 logging.basicConfig(
@@ -34,7 +35,6 @@ if not OPENAI_API_KEY or not POSTGRES_URL:
     logger.error("Missing required environment variables: OPENAI_API_KEY or DATABASE_URL")
     raise RuntimeError("Required environment variables (OPENAI_API_KEY, DATABASE_URL) not set")
 
-# Note: instantiate OpenAI client according to your SDK usage
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
@@ -53,7 +53,7 @@ csv_tables = {}  # {table_name: {columns: [], metadata: {}}}
 query_history = []
 
 # ---------------------------
-# Pydantic Model for Query (accepts either "query" or "text")
+# Pydantic Model for Query
 # ---------------------------
 class QueryRequest(BaseModel):
     query: Optional[str] = None
@@ -77,32 +77,71 @@ def sanitize_table_name(name: str) -> str:
         name = "_" + name
     return name[:63]
 
-def format_query_results(results: List[Dict]) -> str:
-    """Format SQL query results into human-readable text."""
-    if not results:
-        logger.debug("No results found for query")
-        return "No results found."
-    
-    formatted = []
+def generate_natural_language_response(query: str, results: List[Dict]) -> str:
+    """Generate a concise, natural language response from query results (max 200-300 words)."""
+    if not results or not any(r.get("rows") for r in results):
+        logger.debug("No results to format for query")
+        return "No relevant data found for your query."
+
+    # Prepare raw result summary for OpenAI
+    raw_summary = []
     for result in results:
         table = result.get("table", "Unknown")
         columns = result.get("columns", [])
         rows = result.get("rows", [])
-        
         if not rows:
-            logger.debug(f"No rows returned for table: {table}")
             continue
-            
-        formatted.append(f"Results from table '{table}':")
-        formatted.append("-" * 50)
-        formatted.append(" | ".join(columns))
-        formatted.append("-" * 50)
-        for row in rows:
-            formatted.append(" | ".join(str(x) for x in row))
-        formatted.append("")
-        logger.debug(f"Formatted results for table {table}: {len(rows)} rows")
+        raw_summary.append(f"Table: {table}\nColumns: {', '.join(columns)}\nRows (up to 10):\n" +
+                          "\n".join([" | ".join(str(x) for x in row) for row in rows[:10]]))
+
+    combined = "\n\n".join(raw_summary) if raw_summary else "No data available."
     
-    return "\n".join(formatted) or "No valid results found."
+    # Check if query is about clustering
+    is_clustering_query = "cluster" in query.lower() and "queries" in query.lower()
+    
+    if is_clustering_query:
+        # Simple keyword-based clustering
+        all_queries = []
+        for result in results:
+            rows = result.get("rows", [])
+            for row in rows:
+                query_text = row[0] if row else ""  # Assume "Top queries" is first column
+                if query_text and isinstance(query_text, str):
+                    words = query_text.lower().split()
+                    all_queries.extend(words)
+        
+        # Count common keywords
+        keyword_counts = Counter(all_queries)
+        top_keywords = [word for word, count in keyword_counts.most_common(5) if len(word) > 3]
+        cluster_summary = f"Top query clusters based on keywords: {', '.join(top_keywords)}." if top_keywords else "No distinct query clusters found."
+
+    else:
+        cluster_summary = ""
+
+    # Generate natural language response
+    prompt = f"""
+        Summarize the following query results in concise, natural language (150-250 words, max 450 have to answer done with in the max word).
+        - Query: {query}
+        - Data: {combined}
+        - {cluster_summary if is_clustering_query else "Focus on the most relevant data (e.g., top 10 queries by clicks for 'top queries' requests)."}
+        - Avoid technical jargon and raw table formats.
+        - For clustering queries, describe top clusters by topic or keyword.
+        - If no data, say so clearly and suggest checking data sources.
+        """
+    
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=300
+        )
+        answer = resp.choices[0].message.content.strip()
+        logger.debug(f"Generated natural language response: {answer}")
+        return answer
+    except Exception as e:
+        logger.error(f"Failed to generate natural language response: {str(e)}")
+        return "Sorry, I couldn't process the query results. Please try again or check the data."
 
 # ---------------------------
 # Enhanced Query Routing
@@ -111,20 +150,17 @@ def route_query(query: str) -> Dict:
     """Enhanced query router using schema context + heuristic override."""
     logger.debug(f"Routing query: {query}")
 
-    # Heuristic pre-check for obvious NLQ terms
     nlq_keywords = [
-        "salary", "salaries", "revenue", "sales", "profit", "count", "total", 
-        "sum", "average", "avg", "min", "max", "top", "rank", "report", "table", 
-        "number of", "how many", "percentage", "%"
+        "salary", "salaries", "revenue", "sales", "profit", "count", "total",
+        "sum", "average", "avg", "min", "max", "top", "rank", "report", "table",
+        "number of", "how many", "percentage", "%", "cluster"
     ]
     if any(k in query.lower() for k in nlq_keywords):
         logger.info(f"Heuristic matched NLQ keyword for query: {query}")
-        # Still run model for reasoning but bias toward NLQ
         heuristic_bias = True
     else:
         heuristic_bias = False
 
-    # Include available table schemas in the prompt
     schema_info = []
     for table, info in csv_tables.items():
         schema_info.append(f"- {table} (columns: {', '.join(info['columns'])})")
@@ -139,7 +175,7 @@ def route_query(query: str) -> Dict:
         {schema_text}
 
         RULES:
-        1. If the query is about counts, sums, averages, rankings, numeric values, statistics, reports, metrics, salaries, revenues, or other structured data that could be stored in the above tables — classify as NLQ.
+        1. If the query is about counts, sums, averages, rankings, numeric values, statistics, reports, metrics, salaries, revenues, clusters, or other structured data that could be stored in the above tables — classify as NLQ.
         2. Even if the query mentions a person's name or entity, if it is asking for a measurable numeric value (e.g., "Alice's salary", "Bob's sales total") — classify as NLQ.
         3. Only classify as RAG if the answer clearly cannot come from structured data.
 
@@ -154,21 +190,25 @@ def route_query(query: str) -> Dict:
     
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o",  # use higher quality for classification
+            model="gpt-4o",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
             response_format={"type": "json_object"}
         )
         result = json.loads(resp.choices[0].message.content.strip())
 
-        # Heuristic override: if keyword matched and model gave RAG, force NLQ
-        if heuristic_bias and result.get("decision") == "RAG":
+        if heuristic_bias and result.get("decision") == "RAG" and csv_tables:
             logger.warning(f"Overriding model decision to NLQ due to keyword match: {query}")
             result["decision"] = "NLQ"
             result["confidence"] = max(result.get("confidence", 0.5), 0.8)
             result["reasoning"] += " | Overridden by keyword-based heuristic."
 
-        # Final sanity check
+        if not csv_tables:
+            logger.warning(f"No CSV tables available, forcing RAG for query: {query}")
+            result["decision"] = "RAG"
+            result["confidence"] = 0.9
+            result["reasoning"] += " | Forced to RAG due to no available CSV tables."
+
         if result.get("decision") not in ("NLQ", "RAG"):
             logger.warning("Model returned invalid decision, defaulting to RAG")
             return {"decision": "RAG", "confidence": 0.5, "reasoning": "Invalid classification"}
@@ -204,11 +244,9 @@ def save_csv_to_postgres(table_name: str, df: pd.DataFrame, filename: str) -> Di
         cur = conn.cursor()
         logger.debug(f"Connected to PostgreSQL for table: {table_name}")
 
-        # Drop/create table (simple approach)
         cur.execute(f'DROP TABLE IF EXISTS "{table_name}";')
         logger.debug(f"Dropped existing table: {table_name}")
 
-        # Ensure column names are strings and unique
         cols = [str(c) for c in df.columns]
         col_defs = ", ".join([f'"{col}" TEXT' for col in cols])
         cur.execute(f'CREATE TABLE "{table_name}" ({col_defs});')
@@ -250,7 +288,10 @@ def run_nlq_on_postgres(query: str) -> tuple[List[Dict], List[Dict]]:
             Table: "{table_name}"
             Columns: {columns}
             Query: {query}
-            IMPORTANT: Always enclose table names and column names in double quotes to preserve case sensitivity and handle special characters.
+            IMPORTANT: 
+            - Always enclose table names and column names in double quotes to preserve case sensitivity and handle special characters.
+            - For queries asking for 'top queries' or similar, order by "Last 3 months Clicks" DESC and limit to 10 results unless specified otherwise.
+            - For clustering queries (e.g., containing 'cluster'), select relevant columns and avoid grouping by exact query matches unless explicitly requested.
             Return JSON with:
             - sql: the SQL query
             - confidence: float between 0 and 1
@@ -286,7 +327,6 @@ def run_nlq_on_postgres(query: str) -> tuple[List[Dict], List[Dict]]:
                 results.append({"table": table_name, "columns": colnames, "rows": rows})
                 logger.info(f"NLQ executed successfully for {table_name}: {len(rows)} rows returned")
             except psycopg2.ProgrammingError:
-                # No rows to fetch (e.g., command was DDL)
                 results.append({"table": table_name, "columns": [], "rows": []})
                 logger.debug(f"No rows returned for {table_name}")
             cur.close()
@@ -326,7 +366,6 @@ def rag_fallback_for_csv(query: str) -> List[Dict]:
             if conn:
                 conn.close()
     
-    # TODO: Integrate with actual RAG pipeline
     combined = "\n\n".join([d["content"] for d in text_data]) or "No CSV content available."
     return [{"answer": f"RAG fallback for CSV: {query}\n\n{combined}"}]
 
@@ -356,7 +395,6 @@ async def upload_files(files: List[UploadFile] = File(...)):
             pdf_docs.append(filename)
             response["pdfs"].append(filename)
             logger.info(f"Registered PDF file: {filename}")
-            # TODO: Integrate with PDF RAG ingestion
         elif filename.lower().endswith((".csv", ".tsv")):
             try:
                 content = await file.read()
@@ -447,7 +485,6 @@ async def ask_query(body: QueryRequest):
         "routing": routing
     }
 
-    # Default response shape expected by your frontend
     response_payload = {
         "type": None,
         "result": None,
@@ -457,7 +494,6 @@ async def ask_query(body: QueryRequest):
     }
 
     logger.debug(f"csv_tables: {csv_tables}")
-    # NLQ path
     if routing.get("decision") == "NLQ":
         logger.info(f"Routing decision for query {query_id}: NLQ")
         results, sql_logs = run_nlq_on_postgres(query_text)
@@ -465,11 +501,10 @@ async def ask_query(body: QueryRequest):
         non_empty = [r for r in results if r.get("rows")]
 
         if non_empty:
-            formatted_answer = format_query_results(non_empty)
+            formatted_answer = generate_natural_language_response(query_text, non_empty)
             logs["source"] = "NLQ"
             query_history.append(logs)
 
-            # Choose first SQL from logs if present
             first_sql = None
             for s in sql_logs:
                 if s.get("sql"):
@@ -480,7 +515,7 @@ async def ask_query(body: QueryRequest):
                 "type": "NLQ",
                 "result": formatted_answer,
                 "sql": first_sql,
-                "source_documents": [],  # NLQ returns table data; can include table names if needed
+                "source_documents": [],
                 "latency": {
                     "total": (datetime.utcnow() - start_time).total_seconds()
                 }
@@ -488,7 +523,6 @@ async def ask_query(body: QueryRequest):
             logger.info(f"Query {query_id} processed via NLQ: {len(non_empty)} tables with results")
             return response_payload
 
-        # fall back to RAG for CSVs
         logs["fallback_reason"] = "No valid NLQ results"
         logger.warning(f"Falling back to RAG for query {query_id}")
         rag_answer = rag_fallback_for_csv(query_text)
@@ -504,7 +538,6 @@ async def ask_query(body: QueryRequest):
         })
         return response_payload
 
-    # RAG path (including when routing decision is RAG)
     rag_answer = run_pdf_rag(query_text)
     logs["source"] = "RAG"
     query_history.append(logs)
@@ -523,5 +556,4 @@ async def ask_query(body: QueryRequest):
 async def get_logs():
     """Return query history and logs."""
     logger.info("Retrieved logs endpoint")
-    # Ensure everything serializable
     return {"query_history": query_history, "csv_tables": csv_tables, "pdf_docs": pdf_docs}
