@@ -108,32 +108,74 @@ def format_query_results(results: List[Dict]) -> str:
 # Enhanced Query Routing
 # ---------------------------
 def route_query(query: str) -> Dict:
-    """Enhanced query router using GPT-4 with confidence scoring. Defensive: fallback if model fails."""
+    """Enhanced query router using schema context + heuristic override."""
     logger.debug(f"Routing query: {query}")
-    prompt = f"""
-Classify this query into one of two categories:
-- "NLQ" for numeric/tabular/structured data analysis (e.g., sales figures, counts, aggregations)
-- "RAG" for unstructured text/semantic search (e.g., summaries, document content)
-Return a JSON object with:
-- decision: "NLQ" or "RAG"
-- confidence: float between 0 and 1
-- reasoning: brief explanation
 
-Query: {query}
-"""
+    # Heuristic pre-check for obvious NLQ terms
+    nlq_keywords = [
+        "salary", "salaries", "revenue", "sales", "profit", "count", "total", 
+        "sum", "average", "avg", "min", "max", "top", "rank", "report", "table", 
+        "number of", "how many", "percentage", "%"
+    ]
+    if any(k in query.lower() for k in nlq_keywords):
+        logger.info(f"Heuristic matched NLQ keyword for query: {query}")
+        # Still run model for reasoning but bias toward NLQ
+        heuristic_bias = True
+    else:
+        heuristic_bias = False
+
+    # Include available table schemas in the prompt
+    schema_info = []
+    for table, info in csv_tables.items():
+        schema_info.append(f"- {table} (columns: {', '.join(info['columns'])})")
+    schema_text = "\n".join(schema_info) if schema_info else "No CSV tables available"
+
+    prompt = f"""
+        You are a query router for a hybrid system with two modes:
+        - **NLQ**: for numeric/tabular/structured data analysis from CSVs or spreadsheets
+        - **RAG**: for semantic search or summarization from unstructured text/PDFs
+
+        Available CSV tables and columns:
+        {schema_text}
+
+        RULES:
+        1. If the query is about counts, sums, averages, rankings, numeric values, statistics, reports, metrics, salaries, revenues, or other structured data that could be stored in the above tables — classify as NLQ.
+        2. Even if the query mentions a person's name or entity, if it is asking for a measurable numeric value (e.g., "Alice's salary", "Bob's sales total") — classify as NLQ.
+        3. Only classify as RAG if the answer clearly cannot come from structured data.
+
+        Return JSON with:
+        - decision: "NLQ" or "RAG"
+        - confidence: float between 0 and 1
+        - reasoning: brief explanation
+
+        Query: {query}
+        """
+    logger.debug(f"Routing prompt: {prompt}")
+    
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",  # use higher quality for classification
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
+            temperature=0,
             response_format={"type": "json_object"}
         )
         result = json.loads(resp.choices[0].message.content.strip())
+
+        # Heuristic override: if keyword matched and model gave RAG, force NLQ
+        if heuristic_bias and result.get("decision") == "RAG":
+            logger.warning(f"Overriding model decision to NLQ due to keyword match: {query}")
+            result["decision"] = "NLQ"
+            result["confidence"] = max(result.get("confidence", 0.5), 0.8)
+            result["reasoning"] += " | Overridden by keyword-based heuristic."
+
+        # Final sanity check
         if result.get("decision") not in ("NLQ", "RAG"):
             logger.warning("Model returned invalid decision, defaulting to RAG")
-            return {"decision": "RAG", "confidence": 0.5, "reasoning": "Invalid classification, defaulting to RAG"}
+            return {"decision": "RAG", "confidence": 0.5, "reasoning": "Invalid classification"}
+
         logger.info(f"Query routing result: {query} -> {result}")
         return result
+
     except Exception as e:
         logger.error(f"Routing error for query '{query}': {str(e)}")
         return {
@@ -204,15 +246,15 @@ def run_nlq_on_postgres(query: str) -> tuple[List[Dict], List[Dict]]:
         columns = table_info["columns"]
         logger.debug(f"Generating SQL for table: {table_name}, columns: {columns}")
         prompt = f"""
-You are a PostgreSQL expert. Generate a valid PostgreSQL query for:
-Table: {table_name}
-Columns: {columns}
-Query: {query}
-Return JSON with:
-- sql: the SQL query
-- confidence: float between 0 and 1
-- reasoning: brief explanation
-"""
+            You are a PostgreSQL expert. Generate a valid PostgreSQL query for:
+            Table: {table_name}
+            Columns: {columns}
+            Query: {query}
+            Return JSON with:
+            - sql: the SQL query
+            - confidence: float between 0 and 1
+            - reasoning: brief explanation
+            """
         sql_query = ""
         try:
             resp = client.chat.completions.create(
@@ -396,6 +438,7 @@ async def ask_query(body: QueryRequest):
     logger.info(f"Processing query {query_id}: {query_text}")
 
     routing = route_query(query_text)
+    logger.debug(f"Routing decision for query {query_id}: {routing}")
     logs = {
         "query_id": query_id,
         "query": query_text,
@@ -412,8 +455,10 @@ async def ask_query(body: QueryRequest):
         "latency": {}
     }
 
+    logger.debug(f"csv_tables: {csv_tables}")
     # NLQ path
-    if routing.get("decision") == "NLQ" and csv_tables:
+    if routing.get("decision") == "NLQ":
+        logger.info(f"Routing decision for query {query_id}: NLQ")
         results, sql_logs = run_nlq_on_postgres(query_text)
         logs["sql_logs"] = sql_logs
         non_empty = [r for r in results if r.get("rows")]
