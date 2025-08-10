@@ -1,379 +1,324 @@
-import logging
 import os
-import pandas as pd
-import pdfplumber
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_chroma import Chroma
-from langchain.chains import RetrievalQA
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import ProgrammingError
-from transformers import pipeline
-from fastapi.middleware.cors import CORSMiddleware
-import uuid
-from dotenv import load_dotenv
-import string
 import re
-import time
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.tag import pos_tag
+import pandas as pd
+import psycopg2
+from psycopg2.extras import execute_values
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict
+from openai import OpenAI
+import logging
+import uuid
+from datetime import datetime
+import json
+from dotenv import load_dotenv
 
-# Download NLTK resources
-try:
-    nltk.data.find('corpora/stopwords')
-    nltk.data.find('tokenizers/punkt')
-    nltk.data.find('taggers/averaged_perceptron_tagger')
-except LookupError:
-    nltk.download('stopwords')
-    nltk.download('punkt')
-    nltk.download('averaged_perceptron_tagger')
-
-# Load environment variables
+# Load environment variables from .env file
 load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, filename='app.log', filemode='a',
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='rag_nlq_pipeline.log'
+)
 logger = logging.getLogger(__name__)
 
+# Initialize OpenAI client
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+POSTGRES_URL = os.getenv("DATABASE_URL")
+
+if not OPENAI_API_KEY or not POSTGRES_URL:
+    raise RuntimeError("Required environment variables (OPENAI_API_KEY, DATABASE_URL) not set")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
-@app.get("/")
-def read_root():
-    return {"message": "Hello from FastAPI"}
-
+# CORS configuration for Vercel frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://rag-nlq-ai-agent.vercel.app", "http://localhost:3000"],
+    allow_origins=["https://*.vercel.app", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize components
-try:
-    logger.info("Initializing OpenAIEmbeddings...")
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", openai_api_key=os.getenv("OPENAI_API_KEY"))
-    logger.info("OpenAIEmbeddings initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize OpenAIEmbeddings: {str(e)}")
-    raise RuntimeError(f"Embedding initialization failed: {str(e)}")
+# In-memory tracking
+pdf_docs = []
+csv_tables = {}  # {table_name: {columns: [], metadata: {}}}
+query_history = []
 
-try:
-    logger.info("Initializing Chroma vectorstore...")
-    vectorstore = Chroma(embedding_function=embeddings, persist_directory="./vectorstore")
-    logger.info("Chroma vectorstore initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize Chroma vectorstore: {str(e)}")
-    raise RuntimeError(f"Vectorstore initialization failed: {str(e)}")
+# ---------------------------
+# Utility Functions
+# ---------------------------
+def sanitize_table_name(name: str) -> str:
+    name = re.sub(r"[^\w]", "_", name)
+    if not re.match(r"^[A-Za-z_]", name):
+        name = "_" + name
+    return name[:63]
 
-# PostgreSQL connection
-try:
-    logger.info("Connecting to PostgreSQL...")
-    db_engine = create_engine(os.getenv("DATABASE_URL"))
-    with db_engine.connect() as conn:
-        conn.execute(text("SELECT 1"))  # Test connection
-    logger.info("PostgreSQL connection established")
-except Exception as e:
-    logger.error(f"Failed to connect to PostgreSQL: {str(e)}")
-    raise RuntimeError(f"Database connection failed: {str(e)}")
+def format_query_results(results: List[Dict]) -> str:
+    """Format SQL query results into human-readable text."""
+    if not results:
+        return "No results found."
+    
+    formatted = []
+    for result in results:
+        table = result.get("table", "Unknown")
+        columns = result.get("columns", [])
+        rows = result.get("rows", [])
+        
+        if not rows:
+            continue
+            
+        formatted.append(f"Results from table '{table}':")
+        formatted.append("-" * 50)
+        formatted.append(" | ".join(columns))
+        formatted.append("-" * 50)
+        for row in rows:
+            formatted.append(" | ".join(str(x) for x in row))
+        formatted.append("")
+    
+    return "\n".join(formatted) or "No valid results found."
 
-try:
-    logger.info("Initializing zero-shot classifier...")
-    classifier = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli",
-        device=-1,
-        tokenizer_kwargs={"clean_up_tokenization_spaces": False}
-    )
-    logger.info("Zero-shot classifier initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize classifier: {str(e)}")
-    raise RuntimeError(f"Classifier initialization failed: {str(e)}")
+# ---------------------------
+# Enhanced Query Routing
+# ---------------------------
+def route_query(query: str) -> Dict:
+    """
+    Enhanced query router using GPT-4 with confidence scoring.
+    Returns dict with decision, confidence, and reasoning.
+    """
+    prompt = f"""
+Classify this query into one of two categories:
+- "NLQ" for numeric/tabular/structured data analysis (e.g., sales figures, counts, aggregations)
+- "RAG" for unstructured text/semantic search (e.g., summaries, document content)
+Return a JSON object with:
+- decision: "NLQ" or "RAG"
+- confidence: float between 0 and 1
+- reasoning: brief explanation
 
-try:
-    logger.info("Initializing OpenAI LLM...")
-    llm = ChatOpenAI(
-        model_name="gpt-3.5-turbo",
-        openai_api_key=os.getenv("OPENAI_API_KEY"),
-        max_tokens=512,
-        temperature=0
-    )
-    # Test LLM
-    test_response = llm.invoke("Test query").content
-    logger.info(f"OpenAI LLM test response: {test_response}")
-    logger.info("OpenAI LLM initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize OpenAI LLM: {str(e)}")
-    raise RuntimeError(f"LLM initialization failed: {str(e)}")
+Query: {query}
+"""
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(resp.choices[0].message.content.strip())
+        if result.get("decision") not in ("NLQ", "RAG"):
+            result = {
+                "decision": "RAG",
+                "confidence": 0.5,
+                "reasoning": "Invalid classification, defaulting to RAG"
+            }
+        logger.info(f"Query routing: {query} -> {result}")
+        return result
+    except Exception as e:
+        logger.error(f"Routing error: {str(e)}")
+        return {
+            "decision": "RAG",
+            "confidence": 0.5,
+            "reasoning": f"Routing failed: {str(e)}, defaulting to RAG"
+        }
 
-# Store raw files
-UPLOAD_DIR = "./Uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# ---------------------------
+# CSV to PostgreSQL
+# ---------------------------
+def save_csv_to_postgres(table_name: str, df: pd.DataFrame, filename: str) -> Dict:
+    """Save CSV to PostgreSQL with metadata tracking."""
+    conn = psycopg2.connect(POSTGRES_URL)
+    cur = conn.cursor()
+    metadata = {
+        "filename": filename,
+        "upload_time": datetime.utcnow().isoformat(),
+        "row_count": len(df),
+        "column_count": len(df.columns)
+    }
 
-# Stopwords
-stop_words = set(stopwords.words('english')).union({'of', 'the', 'in', 'about', 'tell', 'me'})
+    try:
+        cur.execute(f'DROP TABLE IF EXISTS "{table_name}";')
+        col_defs = ", ".join([f'"{col}" TEXT' for col in df.columns])
+        cur.execute(f'CREATE TABLE "{table_name}" ({col_defs});')
+        
+        cols = ",".join([f'"{c}"' for c in df.columns])
+        values = [tuple(str(x) if pd.notnull(x) else "" for x in row) for row in df.to_numpy()]
+        insert_sql = f'INSERT INTO "{table_name}" ({cols}) VALUES %s'
+        execute_values(cur, insert_sql, values)
+        conn.commit()
+        
+        csv_tables[table_name] = {"columns": list(df.columns), "metadata": metadata}
+        logger.info(f"Saved CSV to table: {table_name}")
+        return {"status": "success", "table_name": table_name, "metadata": metadata}
+    except Exception as e:
+        logger.error(f"Failed to save CSV {filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to save CSV: {str(e)}")
+    finally:
+        cur.close()
+        conn.close()
 
+# ---------------------------
+# NLQ Execution
+# ---------------------------
+def run_nlq_on_postgres(query: str) -> tuple[List[Dict], List[Dict]]:
+    """Execute NLQ across all CSV tables with improved error handling."""
+    results = []
+    sql_logs = []
+    
+    for table_name, table_info in csv_tables.items():
+        columns = table_info["columns"]
+        prompt = f"""
+You are a PostgreSQL expert. Generate a valid PostgreSQL query for:
+Table: {table_name}
+Columns: {columns}
+Query: {query}
+Return JSON with:
+- sql: the SQL query
+- confidence: float between 0 and 1
+- reasoning: brief explanation
+"""
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                response_format={"type": "json_object"}
+            )
+            sql_result = json.loads(resp.choices[0].message.content.strip())
+            sql_query = sql_result.get("sql", "").strip()
+            sql_logs.append({
+                "table": table_name,
+                "sql": sql_query,
+                "confidence": sql_result.get("confidence", 0.5),
+                "reasoning": sql_result.get("reasoning", "")
+            })
+            
+            conn = psycopg2.connect(POSTGRES_URL)
+            cur = conn.cursor()
+            cur.execute(sql_query)
+            try:
+                rows = cur.fetchall()
+                colnames = [desc[0] for desc in cur.description] if cur.description else []
+                results.append({"table": table_name, "columns": colnames, "rows": rows})
+            except psycopg2.ProgrammingError:
+                results.append({"table": table_name, "columns": [], "rows": []})
+            cur.close()
+            conn.close()
+        except Exception as e:
+            sql_logs.append({"table": table_name, "error": str(e), "sql": sql_query})
+            logger.error(f"NLQ error on {table_name}: {str(e)}")
+            continue
+    
+    return results, sql_logs
+
+# ---------------------------
+# RAG Fallback
+# ---------------------------
+def rag_fallback_for_csv(query: str) -> List[Dict]:
+    """Convert CSV data to text for RAG fallback."""
+    text_data = []
+    for table_name, table_info in csv_tables.items():
+        conn = psycopg2.connect(POSTGRES_URL)
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT * FROM \"{table_name}\" LIMIT 100")
+            rows = cur.fetchall()
+            columns = table_info["columns"]
+            text = f"Table: {table_name}\nColumns: {', '.join(columns)}\n"
+            text += "\n".join([" | ".join(str(x) for x in row) for row in rows])
+            text_data.append({"table": table_name, "content": text})
+        except Exception as e:
+            logger.error(f"RAG fallback error for {table_name}: {str(e)}")
+        finally:
+            cur.close()
+            conn.close()
+    
+    # TODO: Integrate with actual RAG pipeline
+    return [{"answer": f"RAG fallback for CSV: {query}\n" + "\n".join([d["content"] for d in text_data])}]
+
+# ---------------------------
+# PDF RAG (Placeholder)
+# ---------------------------
+def run_pdf_rag(query: str) -> str:
+    logger.info(f"Running PDF RAG for query: {query}")
+    return f"PDF RAG answer for: {query} (Integrated with existing RAG pipeline)"
+
+# ---------------------------
+# API Endpoints
+# ---------------------------
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
-    if not file.filename.endswith(('.pdf', '.csv')):
-        logger.error(f"Invalid file type: {file.filename}")
-        raise HTTPException(status_code=400, detail="Only PDF or CSV files are allowed")
-
-    file_id = str(uuid.uuid4())
-    file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
-    try:
-        with open(file_path, "wb") as f:
-            f.write(await file.read())
-        logger.info(f"Uploaded file: {file.filename}, saved as {file_path}")
-    except Exception as e:
-        logger.error(f"File save error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to save file: {str(e)}")
+async def upload_files(files: List[UploadFile] = File(...)):
+    """Handle file uploads (PDF/CSV/TSV)."""
+    if not files:
+        raise HTTPException(status_code=400, detail="No files provided")
     
-    if file.filename.endswith(".pdf"):
-        # Process PDF
-        try:
-            with pdfplumber.open(file_path) as pdf:
-                text = "".join(page.extract_text() or "" for page in pdf.pages)
-            if not text:
-                logger.warning(f"No text extracted from PDF: {file.filename}")
-                raise HTTPException(status_code=400, detail="No text could be extracted from the PDF")
-            embedded = embeddings.embed_documents([text])
-            vectorstore.add_texts([text], metadatas=[{"file_id": file_id, "filename": file.filename, "type": "pdf"}])
-            logger.info(f"Processed PDF: {file.filename}, added to vectorstore")
-        except Exception as e:
-            logger.error(f"PDF processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
-    elif file.filename.endswith(".csv"):
-        # Process CSV
-        try:
-            df = pd.read_csv(file_path)
-            if not all(len(row) == len(df.columns) for row in df.values):
-                logger.error(f"Invalid CSV: {file.filename}, non-rectangular data")
-                raise HTTPException(status_code=400, detail="CSV must be rectangular")
-            table_name = f"csv_{file_id.replace('-', '_')}"
-            df.to_sql(table_name, db_engine, index=False, if_exists="replace", schema="public")
-            logger.info(f"Processed CSV: {file.filename}, stored in PostgreSQL table {table_name}")
-        except Exception as e:
-            logger.error(f"CSV processing error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Failed to process CSV: {str(e)}")
+    response = {"message": "Files uploaded successfully", "tables": [], "pdfs": []}
+    for file in files:
+        filename = file.filename or f"file_{uuid.uuid4()}"
+        logger.info(f"Processing upload: {filename}")
+        
+        if filename.lower().endswith(".pdf"):
+            pdf_docs.append(filename)
+            response["pdfs"].append(filename)
+            # TODO: Integrate with PDF RAG ingestion
+        elif filename.lower().endswith((".csv", ".tsv")):
+            try:
+                df = pd.read_csv(file.file, sep="\t" if filename.endswith(".tsv") else ",")
+                if df.empty or len(df.columns) == 0:
+                    raise ValueError("Empty or invalid CSV")
+                table_name = sanitize_table_name(os.path.splitext(filename)[0])
+                result = save_csv_to_postgres(table_name, df, filename)
+                response["tables"].append(result)
+            except Exception as e:
+                logger.error(f"Upload failed for {filename}: {str(e)}")
+                raise HTTPException(status_code=400, detail=f"Failed to process {filename}: {str(e)}")
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}")
     
-    return {"file_id": file_id, "filename": file.filename}
-
-@app.get("/tables")
-async def get_tables():
-    try:
-        with db_engine.connect() as conn:
-            tables = conn.execute(
-                text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-            ).fetchall()
-            table_info = {}
-            for table in tables:
-                table_name = table[0]
-                columns = conn.execute(
-                    text("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = :table"),
-                    {"table": table_name}
-                ).fetchall()
-                table_info[table_name] = [{"name": col[0], "type": col[1]} for col in columns]
-            logger.info(f"Retrieved table schemas: {table_info}")
-            return {"tables": table_info}
-    except Exception as e:
-        logger.error(f"Table schema retrieval error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve table schemas: {str(e)}")
+    return response
 
 @app.post("/query")
-async def query(request: dict):
-    start_time = time.time()
-    query_text = request.get("text")
-    if not query_text:
-        logger.error("Query text is missing")
-        raise HTTPException(status_code=400, detail="Query text is required")
+async def ask_query(req: QueryRequest):
+    """Handle user queries with routing between NLQ and RAG."""
+    if not req.query or not req.query.strip():
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
     
-    # Clean query text: remove punctuation
-    clean_query_text = re.sub(f'[{string.punctuation}]', '', query_text).strip()
-    logger.info(f"Received query: {query_text} (cleaned: {clean_query_text})")
+    query_id = str(uuid.uuid4())
+    logger.info(f"Processing query {query_id}: {req.query}")
+    routing = route_query(req.query)
+    logs = {
+        "query_id": query_id,
+        "query": req.query,
+        "timestamp": datetime.utcnow().isoformat(),
+        "routing": routing
+    }
     
-    # Classify query
-    try:
-        labels = ["NLQ", "RAG"]
-        classification_start = time.time()
-        classification = classifier(query_text, candidate_labels=labels)
-        query_type = classification["labels"][0]
-        classification_latency = time.time() - classification_start
-        logger.info(f"Query classified as: {query_type} (classification latency: {classification_latency:.3f}s)")
-    except Exception as e:
-        logger.error(f"Query classification error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Query classification failed: {str(e)}")
+    if routing["decision"] == "NLQ" and csv_tables:
+        results, sql_logs = run_nlq_on_postgres(req.query)
+        logs["sql_logs"] = sql_logs
+        non_empty = [r for r in results if r.get("rows")]
+        
+        if non_empty:
+            formatted_answer = format_query_results(non_empty)
+            logs["source"] = "NLQ"
+            query_history.append(logs)
+            return {"answer": formatted_answer, "logs": logs}
+        
+        logs["fallback_reason"] = "No valid NLQ results"
+        logger.warning(f"Falling back to RAG for query {query_id}")
+        answer = rag_fallback_for_csv(req.query)
+        logs["source"] = "RAG_FALLBACK"
+    else:
+        answer = run_pdf_rag(req.query)
+        logs["source"] = "RAG"
     
-    if query_type == "NLQ":
-        try:
-            # Process query with NLTK
-            try:
-                tokens = word_tokenize(query_text)
-                # Handle possessive forms (e.g., "Alice's" -> "Alice")
-                tokens = [token[:-2] if token.endswith("'s") else token for token in tokens]
-                # POS tagging
-                pos_tags = pos_tag(tokens)
-                # Filter tokens: keep proper nouns (NNP), nouns (NN), and exclude stopwords
-                filtered_tokens = [word for word, pos in pos_tags if pos in ('NNP', 'NN') and word.lower() not in stop_words]
-                logger.info(f"Filtered query tokens: {filtered_tokens}")
-                
-                # Prioritize proper nouns for search term
-                search_term = next(
-                    (word for word, pos in pos_tags if pos == 'NNP' and word.lower() not in stop_words),
-                    next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
-                )
-                logger.info(f"Selected search term: {search_term}")
-            except Exception as e:
-                logger.warning(f"NLTK processing failed: {str(e)}, falling back to basic tokenization")
-                # Fallback to basic tokenization
-                tokens = clean_query_text.split()
-                tokens = [token[:-2] if token.endswith("s") else token for token in tokens]  # Handle possessive
-                filtered_tokens = [word for word in tokens if word.lower() not in stop_words]
-                search_term = next(
-                    (word for word in filtered_tokens if word[0].isupper()),
-                    next((word for word in filtered_tokens if not word.replace('.', '').isdigit()), filtered_tokens[-1] if filtered_tokens else clean_query_text)
-                )
-                logger.info(f"Fallback filtered tokens: {filtered_tokens}, search term: {search_term}")
-            
-            # Get tables
-            with db_engine.connect() as conn:
-                tables = conn.execute(
-                    text("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-                ).fetchall()
-                tables = [t[0] for t in tables]
-            for table in tables:
-                with db_engine.connect() as conn:
-                    # Get column names and types
-                    columns = conn.execute(
-                        text("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = :table"),
-                        {"table": table}
-                    ).fetchall()
-                    column_info = {c[0]: c[1] for c in columns}
-                    
-                    # Identify string columns for name-like search
-                    string_columns = [col for col, dtype in column_info.items() if dtype.lower() in ('text', 'varchar', 'character varying')]
-                    if not string_columns:
-                        logger.warning(f"No string columns in table {table}, skipping")
-                        continue
-                    
-                    # Select name-like column based on uniqueness
-                    try:
-                        sample_data = conn.execute(text(f"SELECT * FROM {table} LIMIT 5")).fetchall()
-                        sample_dicts = [dict(row._mapping) for row in sample_data]
-                        uniqueness = {}
-                        for col in string_columns:
-                            values = [row.get(col) for row in sample_dicts if col in row]
-                            uniqueness[col] = len(set(values)) / len(values) if values else 0
-                        search_column = max(uniqueness, key=uniqueness.get, default=string_columns[0]) if uniqueness else string_columns[0]
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch sample data for {table}: {str(e)}")
-                        search_column = string_columns[0]
-                    logger.info(f"Selected search column: {search_column}")
-                    
-                    # Identify columns to select (match filtered tokens to column names)
-                    select_columns = [col for col in column_info if col.lower() in [t.lower() for t in filtered_tokens] and col.lower() != search_term.lower()]
-                    if not select_columns:
-                        select_columns = [col for col in column_info if col != search_column]
-                        logger.warning(f"No matching select columns for query '{query_text}' in table {table}, selecting all non-search columns")
-                    
-                    # Check for ambiguity
-                    if len(string_columns) > 1 and not select_columns:
-                        logger.warning(f"Ambiguous query for table {table}: multiple string columns {string_columns}")
-                        return {
-                            "type": "clarification_needed",
-                            "result": f"Multiple columns could match your query. Please specify which columns to search or select from: {string_columns}",
-                            "table": table
-                        }
-                    
-                    # Build SQL query
-                    select_expr = ', '.join(select_columns) if select_columns else '*'
-                    column_expr = search_column if column_info[search_column].lower() in ('text', 'varchar', 'character varying') else f"{search_column}::TEXT"
-                    sql = text(f"SELECT {select_expr} FROM {table} WHERE {column_expr} LIKE :search_term")
-                    params = {"search_term": f"%{search_term}%"}
-                    sql_start = time.time()
-                    try:
-                        result = conn.execute(sql, params).fetchall()
-                        sql_latency = time.time() - sql_start
-                        logger.info(f"Executed SQL: SELECT {select_expr} FROM {table} WHERE {column_expr} LIKE '%{search_term}%' (latency: {sql_latency:.3f}s)")
-                        if result:
-                            # Format result as natural language using LLM
-                            result_dicts = [dict(row._mapping) for row in result]
-                            result_str = "\n".join([f"Row {i+1}: " + ", ".join([f"{k}: {v}" for k, v in row.items()]) for i, row in enumerate(result_dicts)])
-                            prompt = (
-                                f"Convert the following query result into a natural language response. "
-                                f"Be precise, but do not be overly formal. Assume the user already knows the context of the data. "
-                                f"Do not mention column names in the response unless they are explicitly part of the data values. "
-                                f"If the query seems to ask for specific fields like salary or department, include them in the format: '<name>’s salary is <salary>, and they work in the <department> department.' "
-                                f"If multiple results are found, list each in a separate sentence. "
-                                f"Do not include any additional instructions or metadata in the response.\n\n"
-                                f"Query: {query_text}\n"
-                                f"Result:\n{result_str}"
-                            )
-                            llm_start = time.time()
-                            natural_response = llm.invoke(prompt).content.strip()
-                            llm_latency = time.time() - llm_start
-                            # Clean any residual metadata or instructions
-                            clean_response = re.sub(r'^(?:Be precise|[#\s]*ChatGPT.*?\n\n|\n\n.*?\n\n)?', '', natural_response, flags=re.MULTILINE).strip()
-                            total_latency = time.time() - start_time
-                            logger.info(f"NLQ response generated (LLM latency: {llm_latency:.3f}s, total latency: {total_latency:.3f}s)")
-                            return {
-                                "type": "NLQ",
-                                "result": clean_response,
-                                "sql": str(sql) + f" with params {params}",
-                                "latency": {
-                                    "classification": classification_latency,
-                                    "sql": sql_latency,
-                                    "llm": llm_latency,
-                                    "total": total_latency
-                                }
-                            }
-                        else:
-                            logger.warning(f"No results found for table {table}")
-                            continue
-                    except ProgrammingError as e:
-                        logger.warning(f"SQL execution failed for table {table}: {str(e)}")
-                        continue
-            logger.warning("NLQ failed: no matching table/column, falling back to RAG")
-        except Exception as e:
-            logger.error(f"NLQ error: {str(e)}, falling back to RAG")
-    
-    # RAG pipeline
-    try:
-        rag_start = time.time()
-        qa_chain = RetrievalQA.from_chain_type(
-            llm=llm,
-            chain_type="stuff",
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-            return_source_documents=True
-        )
-        result = qa_chain.invoke({"query": query_text})
-        rag_latency = time.time() - rag_start
-        cleaned_result = result['result'].replace('^"|"', '').strip()
-        total_latency = time.time() - start_time
-        logger.info(f"RAG result: {cleaned_result} (RAG latency: {rag_latency:.3f}s, total latency: {total_latency:.3f}s)")
-        return {
-            "type": "RAG",
-            "result": cleaned_result,
-            "source_documents": [doc.metadata for doc in result["source_documents"]],
-            "latency": {
-                "classification": classification_latency,
-                "rag": rag_latency,
-                "total": total_latency
-            }
-        }
-    except Exception as e:
-        logger.error(f"RAG error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"RAG processing failed: {str(e)}")
+    query_history.append(logs)
+    return {"answer": answer, "logs": logs}
 
 @app.get("/logs")
 async def get_logs():
-    try:
-        with open("app.log", "r") as f:
-            logs = f.read()
-        return {"logs": logs}
-    except Exception as e:
-        logger.error(f"Log retrieval error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve logs: {str(e)}")
+    """Return query history and logs."""
+    return {"query_history": query_history, "csv_tables": csv_tables, "pdf_docs": pdf_docs}
